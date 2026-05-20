@@ -1,0 +1,184 @@
+name: Castbox Channel Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel_url:
+        description: 'Castbox Channel URL (e.g., https://castbox.fm/va/5439580)'
+        required: true
+        type: string
+
+      max_workers:
+        description: 'Max parallel requests (Concurrency)'
+        required: false
+        type: string
+        default: '10'
+
+      upload_method:
+        description: '📤 Save Method'
+        required: true
+        type: choice
+        options:
+          - repository (push to repo)
+          - release (GitHub Releases)
+        default: 'repository (push to repo)'
+
+permissions:
+  contents: write
+
+jobs:
+  scrape-castbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📂 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔧 Setup Python & Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          pip3 install --quiet aiohttp
+
+      - name: 🕷️ Scrape Castbox Data
+        id: scrape
+        run: |
+          python3 << 'EOF'
+          import os, sys, re, csv, asyncio, aiohttp, random
+          
+          URL = os.environ.get('INPUT_URL', '')
+          MAX_WORKERS = int(os.environ.get('INPUT_WORKERS', 10))
+          
+          # Extract Channel ID (cid)
+          cid_match = re.search(r'(?:/va/|/ch/|cids=)(\d+)', URL)
+          if not cid_match:
+              print("::error::Invalid Castbox URL. Could not extract channel ID (cid).")
+              sys.exit(1)
+          cid = cid_match.group(1)
+          
+          USER_AGENTS = [
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36",
+              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
+          ]
+
+          async def fetch_episode(session, eid, sem, retries=3):
+              async with sem:
+                  for attempt in range(retries):
+                      try:
+                          headers = {"User-Agent": random.choice(USER_AGENTS)}
+                          api_url = f"https://everest.castbox.fm/data/episode/v4?eid={eid}"
+                          async with session.get(api_url, headers=headers, timeout=15) as resp:
+                              if resp.status == 200:
+                                  data = await resp.json()
+                                  if data.get('code') == 0:
+                                      return data['data']
+                      except Exception:
+                          pass
+                      await asyncio.sleep(random.uniform(0.5, 1.5) * (attempt + 1))
+                  return None
+
+          async def main():
+              print(f"🔍 Fetching overview for CID: {cid}...")
+              headers = {"User-Agent": random.choice(USER_AGENTS)}
+              
+              async with aiohttp.ClientSession() as session:
+                  # 1. Fetch Episode Overview to get all EIDs
+                  overview_url = f"https://everest.castbox.fm/data/episodes/overview?cids={cid}"
+                  async with session.get(overview_url, headers=headers) as resp:
+                      if resp.status != 200:
+                          print("::error::Failed to fetch channel overview.")
+                          sys.exit(1)
+                      overview_data = await resp.json()
+                  
+                  eids = []
+                  for item in overview_data.get('data', []):
+                      for ep in item.get('episode_list', []):
+                          eids.append(ep['eid'])
+                  
+                  print(f"📦 Found {len(eids)} episodes. Starting parallel fetch with max_workers={MAX_WORKERS}...")
+                  
+                  # 2. Fetch Episode Details in Parallel
+                  sem = asyncio.Semaphore(MAX_WORKERS)
+                  tasks = [fetch_episode(session, eid, sem) for eid in eids]
+                  
+                  results = []
+                  completed = 0
+                  
+                  for task in asyncio.as_completed(tasks):
+                      res = await task
+                      completed += 1
+                      if res:
+                          results.append(res)
+                      # Simple progress bar logic
+                      progress = int((completed / len(eids)) * 20)
+                      bar = "█" * progress + "-" * (20 - progress)
+                      print(f"\r⏳ Progress: [{bar}] {completed}/{len(eids)}", end="", flush=True)
+                  
+                  print("\n✅ Data fetching complete!")
+                  
+                  # 3. Save to CSV
+                  if results:
+                      csv_filename = f"castbox_channel_{cid}.csv"
+                      
+                      # Selecting useful fields for CSV
+                      fieldnames = [
+                          'eid', 'title', 'release_date', 'duration', 'size', 
+                          'play_count', 'like_count', 'comment_count', 'download_count',
+                          'url', 'cover_url', 'ep_desc_url', 'description'
+                      ]
+                      
+                      with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
+                          writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                          writer.writeheader()
+                          writer.writerows(results)
+                          
+                      print(f"💾 Saved data to {csv_filename}")
+                      
+                      # Pass variables to GitHub Actions outputs
+                      with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                          f.write(f"filename={csv_filename}\n")
+                          channel_title = results[0].get('channel', {}).get('title', f'Channel_{cid}')
+                          f.write(f"title={channel_title}\n")
+                  else:
+                      print("::error::No data extracted!")
+                      sys.exit(1)
+
+          asyncio.run(main())
+          EOF
+        env:
+          INPUT_URL: ${{ github.event.inputs.channel_url }}
+          INPUT_WORKERS: ${{ github.event.inputs.max_workers }}
+
+      - name: 📅 Get Current Date
+        id: get_date
+        run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: 📤 Push CSV to Repository
+        if: github.event.inputs.upload_method == 'repository (push to repo)'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p castbox_data
+          mv ${{ steps.scrape.outputs.filename }} castbox_data/
+          git add castbox_data/
+          git commit -m "📊 Castbox Data: ${{ steps.scrape.outputs.title }} [skip ci]" || echo "Nothing to commit"
+          git push
+
+      - name: 📤 Upload CSV to GitHub Releases
+        if: github.event.inputs.upload_method == 'release (GitHub Releases)'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: castbox-${{ github.run_number }}
+          name: Castbox Data - ${{ steps.scrape.outputs.title }}
+          body: |
+            **🎙️ Castbox Channel Data Export**
+
+            **Channel:** ${{ steps.scrape.outputs.title }}
+            **Original Link:** ${{ github.event.inputs.channel_url }}
+            **Scraped on:** ${{ steps.get_date.outputs.date }}
+          files: ${{ steps.scrape.outputs.filename }}
+          token: ${{ secrets.GITHUB_TOKEN }}
